@@ -363,6 +363,37 @@ def bellman_ford(my_id, servers, neighbors,
 
     return updated
 
+def update_link(my_id, server1, server2, new_cost, servers, 
+                neighbors, neighbor_vectors, routing_table):
+
+    #Verify that both IDs exist 
+    if server1 not in servers or server2 not in servers:
+        raise ValueError("Link does not involve this server")
+
+    #verify that this command involes the local server
+    if my_id != server1 and my_id != server2:
+        raise ValueError("Link does not involve this server")
+
+    #idetify this other server 
+    neighbor_id = server2 if my_id == server1 else server1
+
+    #see if the other server is a DIRECT neighbor 
+    if neighbor_id not in neighbors:
+        raise ValueError("Server is not a direct neighbor")
+
+    #update direct link cost
+    neighbors[neighbor_id] = new_cost
+
+    # Recalculate routing table
+    updated = bellman_ford(
+        my_id,
+        servers,
+        neighbors,
+        neighbor_vectors,
+        routing_table
+    )
+
+    return updated
 
 def main():
     parser = argparse.ArgumentParser()
@@ -422,19 +453,53 @@ def main():
 
     try:
         while True:
+            # inputs made into string
+            # ["update", "server#", "neighserver#", "new cost"]
             command = input("> ").strip().lower()
+            command_parts = command.split()
 
-            if command == "step":
+            #command_parts[0] is the action the user wants to do 
+            if command_parts[0] == "step":
                 with routing_lock:
                     send_messages(
                         sock, my_id, servers, neighbors, routing_table
                     )
+                    
+            elif command_parts[0] == "update":
 
-            elif command == "display":
+                if len(command_parts) != 4:
+                    print("update ERROR: Invalid arguments")
+                    continue
+
+                try:
+                    server1 = int(command_parts[1])
+                    server2 = int(command_parts[2])
+
+                    if command_parts[3] == "inf":
+                        new_cost = float("inf")
+                    else:
+                        new_cost = int(command_parts[3])
+                        
+                        if new_cost <0 or new_cost >= INFINITY:
+                        
+                            raise ValueError("Invalid link cost")
+                
+                    with routing_lock:
+                        update_link(my_id, server1, server2, new_cost,servers,
+                                    neighbors,neighbor_vectors, routing_table)
+                        display_routing_table(routing_table)
+                    print(f"{command} SUCCESS")
+                
+                except ValueError as error:
+                    print(f"{command} ERROR: {error}")        
+
+            elif command_parts[0] == "display":
                 display_routing_table(routing_table)
 
-            elif command == "exit":
+            elif command_parts[0] == "exit":
                 break
+
+            
 
             else:
                 print("Unknown command")
