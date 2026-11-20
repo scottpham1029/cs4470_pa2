@@ -1,3 +1,17 @@
+# Implementation overview:
+# Each process reads its own topology file to identify its local server, all
+# server addresses, and direct link costs, then binds a UDP socket locally.
+# The initial routing table contains cost 0 to itself, configured costs to
+# neighbors, and infinity to all other destinations.
+# A receiver thread validates neighbor updates and saves their distance vectors.
+# Bellman-Ford recomputes routes after updates, link changes, and timeouts.
+# A periodic thread checks for neighbors silent for three update intervals and
+# advertises the current table. Only this thread and the step command send updates.
+# The main thread handles update/disable (local link changes), display (sorted
+# routes), packets (read and reset the receive count), and crash (stop the server).
+# A shared lock protects routing state and the packet count across these threads;
+# a stop event tells the worker threads to finish before the socket is closed.
+
 import argparse
 import socket
 import threading
@@ -163,6 +177,11 @@ def receive_messages(sock, my_id, servers, neighbors,
 
 
 def initialize_routing_table(my_id, servers, neighbors):
+    # ROUTING TABLE DATA STRUCTURE:
+    # routing_table[destination_server_id] = {"next_hop": server_id, "cost": cost}
+    # Each destination maps to its next hop and total path cost. The local route
+    # points to itself with cost 0. Unreachable routes use next_hop=None and
+    # cost=float("inf"); display renders these as -1 and inf, respectively.
     routing_table = {}
 
     for server_id in servers:
@@ -194,10 +213,14 @@ def initialize_routing_table(my_id, servers, neighbors):
 # Maximum 16-bit unsigned value represents infinity
 INFINITY = 65535
 
-# Packet structure:
+# ROUTING UPDATE MESSAGE DATA STRUCTURE (one UDP datagram):
 # Header: 2-byte count, 2-byte sender port, 4-byte sender IP
 # Entry: 4-byte IP, 2-byte port, 2-byte reserved,
 #        2-byte ID, 2-byte cost
+# All integers use network byte order (big-endian); the reserved field is zero.
+# The header is followed by one entry per destination, including the sender.
+# Total size is 8 + 12 * count bytes. Cost 65535 encodes infinity on the wire;
+# decoding converts it back to float("inf") for routing calculations.
 
 def create_routing_packet(my_id, servers, routing_table):
     my_ip = servers[my_id]["ip"]
@@ -263,7 +286,7 @@ def decode_routing_packet(data):
     return sender_ip, sender_port, distance_vector
 
 
-#temporary routing table format, not final explicit formal required by this assignment
+# Display destinations in ascending ID order using the required three columns.
 def display_routing_table(routing_table):
     # Exact three-column format required by the assignment.
     # An unreachable destination has no next hop (-1) and infinite cost.
@@ -277,6 +300,9 @@ def display_routing_table(routing_table):
 
 def bellman_ford(my_id, servers, neighbors,
                  neighbor_vectors, routing_table):
+    # For each destination d, compare the direct link with every usable route
+    # through neighbor n: link_cost(n) + neighbor_vectors[n][d]. Keep the lowest
+    # cost and its next hop; keep the local server's own cost fixed at zero.
     updated = False
 
     for destination in servers:
@@ -362,6 +388,9 @@ def periodic_updates(sock, my_id, servers, neighbors,
                      routing_lock, last_seen, configured_costs,
                      timed_out, interval, stop_event):
     
+    # Check silence at each periodic tick. After at least three intervals without
+    # an accepted update, invalidate the link and cached vector, then recompute.
+    # Keep the destination in the routing table; another neighbor may reach it.
     while not stop_event.wait(interval):
         with routing_lock:
             now = time.monotonic()
@@ -399,6 +428,8 @@ def main():
     my_id, num_servers, num_neighbors, servers, neighbors = read_topology(args.t)
     
     routing_table = initialize_routing_table(my_id, servers, neighbors)
+    # neighbor_vectors[neighbor_id][destination_id] stores the neighbor's most
+    # recently advertised cost, used alongside our direct costs by Bellman-Ford.
     neighbor_vectors = {}
 
     configured_costs = neighbors.copy()  # last explicitly set link cost
