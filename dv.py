@@ -1,8 +1,8 @@
-
 import argparse
 import socket
 import threading
 import struct
+import time
 
 packet_count = 0
 
@@ -101,7 +101,7 @@ def send_messages(sock, my_id, servers, neighbors, routing_table):
 
 def receive_messages(sock, my_id, servers, neighbors,
                      neighbor_vectors, routing_table,
-                     routing_lock):
+                     routing_lock, last_seen):
     global packet_count
 
     while True:
@@ -140,6 +140,8 @@ def receive_messages(sock, my_id, servers, neighbors,
                 # Ignore disabled neighbors
                 if neighbors[sender_id] == float("inf"):
                     continue
+
+                last_seen[sender_id] = time.monotonic()
 
                 print(
                     f"\nRECEIVED A MESSAGE FROM SERVER {sender_id}"
@@ -411,6 +413,34 @@ def commands():
         "Type 'commands' to recieve command list\n"
         )
 
+def periodic_updates(sock, my_id, servers, neighbors,
+                     neighbor_vectors, routing_table,
+                     routing_lock, last_seen, interval, stop_event):
+
+    while not stop_event.wait(interval):
+        now = time.monotonic()
+        timed_out = []
+
+        with routing_lock:
+            for neighbor_id, link_cost in neighbors.items():
+                if (
+                    link_cost != float("inf")
+                    and now - last_seen[neighbor_id] >= 3 * interval
+                ):
+                    neighbors[neighbor_id] = float("inf")
+                    neighbor_vectors.pop(neighbor_id, None)
+                    timed_out.append(neighbor_id)
+
+            if timed_out:
+                bellman_ford(
+                    my_id, servers, neighbors,
+                    neighbor_vectors, routing_table
+                )
+                for neighbor_id in timed_out:
+                    print(f"Server {neighbor_id} timed out.")
+
+            send_messages(sock, my_id, servers, neighbors, routing_table)
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -439,6 +469,12 @@ def main():
 
     neighbor_vectors = {}
 
+    last_seen = {
+    	neighbor_id: time.monotonic()
+    	for neighbor_id in neighbors
+    }
+    stop_event = threading.Event()
+
     routing_lock = threading.Lock()
 
     # Create and bind UDP socket
@@ -454,12 +490,24 @@ def main():
             neighbors,
             neighbor_vectors,
             routing_table,
-            routing_lock
+            routing_lock,
+	        last_seen
         ),
         daemon=True
     )
 
     receiver_thread.start()
+
+    periodic_thread = threading.Thread(
+        target=periodic_updates,
+        args=(
+            sock, my_id, servers, neighbors,
+            neighbor_vectors, routing_table, routing_lock,
+            last_seen, args.i, stop_event
+        ),
+        daemon=True
+    )
+    periodic_thread.start()
 
     commands()
 
@@ -501,6 +549,8 @@ def main():
                     with routing_lock:
                         update_link(my_id, server1, server2, new_cost,servers,
                                     neighbors,neighbor_vectors, routing_table)
+                        neighbor_id = server2 if my_id == server1 else server1
+                        last_seen[neighbor_id] = time.monotonic()
                         display_routing_table(routing_table)
                     print(f"{command} SUCCESS")
                 
@@ -513,6 +563,33 @@ def main():
                     packet_count = 0
                     print("packets SUCCESS")
 
+            elif command_parts[0] == "disable":
+                if len(command_parts) != 2:
+                    print(f"{command} ERROR: Invalid arguments")
+                    continue
+                try:
+                    neighbor_id = int(command_parts[1])
+
+                    with routing_lock:
+                        update_link(
+                            my_id,
+                            my_id,
+                            neighbor_id,
+                            float("inf"),
+                            servers,
+                            neighbors,
+                            neighbor_vectors,
+                            routing_table
+                        )
+
+                    print(f"{command} SUCCESS")
+
+                except ValueError as error:
+                    print(f"{command} ERROR: {error}")
+
+            elif command_parts[0] == "crash":
+                print(f"{command} SUCCESS")
+                break
 
             elif command_parts[0] == "display":
                 display_routing_table(routing_table)
@@ -531,6 +608,7 @@ def main():
         pass
 
     finally:
+        stop_event.set()
         sock.close()
         print(f"Server {my_id} stopped.")
 
