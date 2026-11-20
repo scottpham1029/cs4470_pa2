@@ -4,6 +4,7 @@ import socket
 import threading
 import struct
 
+packet_count = 0
 
 def read_topology(filename):
     #open and read topology file
@@ -100,6 +101,7 @@ def send_messages(sock, my_id, servers, neighbors, routing_table):
 def receive_messages(sock, my_id, servers, neighbors,
                      neighbor_vectors, routing_table,
                      routing_lock):
+    global packet_count
 
     while True:
         try:
@@ -141,6 +143,7 @@ def receive_messages(sock, my_id, servers, neighbors,
                 print(
                     f"\nRECEIVED A MESSAGE FROM SERVER {sender_id}"
                 )
+                packet_count += 1
 
                 # Store the neighbor's latest distance vector
                 neighbor_vectors[sender_id] = distance_vector
@@ -451,6 +454,8 @@ def main():
     "Type 'exit' to stop the server.\n"
     )
 
+    global packet_count
+
     try:
         while True:
             # inputs made into string
@@ -492,6 +497,13 @@ def main():
                 
                 except ValueError as error:
                     print(f"{command} ERROR: {error}")        
+
+            elif command_parts[0] == "packets":
+                with routing_lock:
+                    print(f"Packets: {packet_count}")
+                    packet_count = 0
+                    print("packets SUCCESS")
+
 
             elif command_parts[0] == "display":
                 display_routing_table(routing_table)
