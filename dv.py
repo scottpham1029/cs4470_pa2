@@ -58,6 +58,7 @@ def read_topology(filename):
 
     return my_id, num_servers, num_neighbors, servers, neighbors
 
+#UDP connnection
 def initialize_socket(my_id, servers):
     my_ip = servers[my_id]["ip"]
     my_port = servers[my_id]["port"]
@@ -398,6 +399,18 @@ def update_link(my_id, server1, server2, new_cost, servers,
 
     return updated
 
+def commands():
+    print(
+        "\nType 'step' to send a test message.\n"
+        "Type 'update <server-ID1> <server-ID2> <New Link Cost>' to update cost between the links\n"
+        "Type 'packets' to display the number of packets received since the last invoivation\n"
+        "Type 'display' to display routing table\n"
+        "Type 'disable <server-ID>' to disable link to given server\n"
+        "Type 'crash' to close all connections in this server\n"
+        "Type 'exit' to stop the server.\n"
+        "Type 'commands' to recieve command list\n"
+        )
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -448,17 +461,13 @@ def main():
 
     receiver_thread.start()
 
-    print(
-    "\nType 'step' to send a test message.\n"
-    "Type 'display' to display routing table\n"
-    "Type 'exit' to stop the server.\n"
-    )
+    commands()
 
     global packet_count
 
     try:
         while True:
-            # inputs made into string
+            # inputs made into string list
             # ["update", "server#", "neighserver#", "new cost"]
             command = input("> ").strip().lower()
             command_parts = command.split()
@@ -510,7 +519,9 @@ def main():
 
             elif command_parts[0] == "exit":
                 break
-
+            
+            elif command_parts[0] == "commands":
+                commands()
             
 
             else:
