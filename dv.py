@@ -7,56 +7,64 @@ import time
 packet_count = 0
 
 def read_topology(filename):
-    #open and read topology file
-    #store each lines in a list
+    # Each topology file lists all routers, but only local direct links.
     with open(filename, "r") as file:
         lines = [line.strip() for line in file if line.strip()]
 
-    #first two lines
+    if len(lines) < 2:
+        raise ValueError("Incomplete topology file")
     num_servers = int(lines[0])
     num_neighbors = int(lines[1])
 
-    #read all server IDs, IPs, and ports
-    servers = {}
+    if num_servers < 1 or num_neighbors < 0:
+        raise ValueError("Invalid server or neighbor count")
+    
+    if len(lines) != 2 + num_servers + num_neighbors:
+        raise ValueError("Topology line count does not match header")
 
+    servers = {}
     for line in lines[2:2 + num_servers]:
         server_id, ip, port = line.split()
+        server_id, port = int(server_id), int(port)
 
-        servers[int(server_id)] = {
-            "ip": ip,
-            "port": int(port)
-        }
+        if server_id in servers:
+            raise ValueError("Duplicate server ID")
+        
+        if not (1 <= port <= 65535):
+            raise ValueError("Invalid server port")
+        
+        servers[server_id] = {"ip": ip, "port": port}
 
-    #read direct neighbor information
-    neighbors = {}
+    links = [tuple(map(int, line.split()))
+             for line in lines[2 + num_servers:]]
 
-    for line in lines[2 + num_servers:]:
-        source, destination, cost = map(int, line.split())
-
-        #figure 1 example: 1->2, cost is 7
-        neighbors[destination] = cost
-
-    #determine which server this topology file belongs to
-    links = [
-        tuple(map(int, line.split()))
-        for line in lines[2 + num_servers:]
-    ]
-
+    # All direct links share the local server ID (for this assignment's topology).
     possible_ids = set(servers)
-
     for source, destination, cost in links:
+        if source not in servers or destination not in servers or source == destination:
+            raise ValueError("Invalid link endpoints")
+        
+        if not (0 <= cost < INFINITY):
+            raise ValueError("Invalid initial link cost")
+        
         possible_ids &= {source, destination}
 
     if len(possible_ids) != 1:
-        raise ValueError("Cannot uniquely determine local server ID")
-
+        raise ValueError("Cannot uniquely determine local server ID from links")
+    
     my_id = possible_ids.pop()
 
-    # Verify the number of neighbors
-    if len(links) != num_neighbors:
-        raise ValueError("Neighbor count does not match topology file")
+    neighbors = {}
+    for source, destination, cost in links:
+        neighbor_id = destination if source == my_id else source
+
+        if neighbor_id in neighbors:
+            raise ValueError("Duplicate neighbor link")
+        
+        neighbors[neighbor_id] = cost
 
     return my_id, num_servers, num_neighbors, servers, neighbors
+
 
 #UDP connnection
 def initialize_socket(my_id, servers):
@@ -98,76 +106,59 @@ def send_messages(sock, my_id, servers, neighbors, routing_table):
     #print(f"Packet size: {len(packet)} bytes")
 
 
-
 def receive_messages(sock, my_id, servers, neighbors,
-                     neighbor_vectors, routing_table,
-                     routing_lock, last_seen):
+                     neighbor_vectors, routing_table, routing_lock,
+                     last_seen, configured_costs, timed_out, stop_event):
     global packet_count
 
-    while True:
+    while not stop_event.is_set():
         try:
             data, address = sock.recvfrom(4096)
+            sender_ip, sender_port, distance_vector = decode_routing_packet(data)
 
-            sender_ip, sender_port, distance_vector = (
-                decode_routing_packet(data)
-            )
-
-            # Identify the sending server
             sender_id = None
-
             for server_id, info in servers.items():
-                if (
-                    info["ip"] == sender_ip
-                    and info["port"] == sender_port
-                ):
+                if info["ip"] == sender_ip and info["port"] == sender_port:
                     sender_id = server_id
                     break
 
-            # Only accept updates from direct neighbors
-            if sender_id not in neighbors:
+            if sender_id not in neighbors or address != (sender_ip, sender_port):
                 continue
 
-            # Verify the UDP source address
-            if address != (sender_ip, sender_port):
-                continue
-
-            # Verify the destinations in the packet
             if set(distance_vector) != set(servers):
                 continue
 
             with routing_lock:
-
-                # Ignore disabled neighbors
+                # Explicitly disabled links stay down. Timeouts can recover.
                 if neighbors[sender_id] == float("inf"):
-                    continue
+                    if sender_id not in timed_out:
+                        continue
+
+                    neighbors[sender_id] = configured_costs[sender_id]
+                    timed_out.remove(sender_id)
+                    print(f"\nServer {sender_id} is available again.")
 
                 last_seen[sender_id] = time.monotonic()
-
-                print(
-                    f"\nRECEIVED A MESSAGE FROM SERVER {sender_id}"
-                )
                 packet_count += 1
 
-                # Store the neighbor's latest distance vector
+                print(f"\nRECEIVED A MESSAGE FROM SERVER {sender_id}")
+
                 neighbor_vectors[sender_id] = distance_vector
-
-                # Recalculate our routing table
-                updated = bellman_ford(
-                    my_id,
-                    servers,
-                    neighbors,
-                    neighbor_vectors,
-                    routing_table
-                )
-
-                if updated:
+                if bellman_ford(my_id, servers, neighbors,
+                                neighbor_vectors, routing_table):
                     print("Routing table updated.")
+
+        except socket.timeout:
+            continue
 
         except ValueError as error:
             print(f"\nInvalid routing packet: {error}")
 
         except OSError:
+            if not stop_event.is_set():
+                print("\nUDP receiver stopped due to socket error.")
             break
+
 
 
 
@@ -211,38 +202,20 @@ INFINITY = 65535
 def create_routing_packet(my_id, servers, routing_table):
     my_ip = servers[my_id]["ip"]
     my_port = servers[my_id]["port"]
+    
+    packet = struct.pack("!HH4s", len(routing_table), my_port,
+                         socket.inet_aton(my_ip))
 
-    num_entries = len(routing_table)
-
-    # Build packet header
-    packet = struct.pack(
-        "!HH4s",
-        num_entries,
-        my_port,
-        socket.inet_aton(my_ip)
-    )
-
-    # Add each destination's routing information
+    # Packet entry: IPv4 (4), port (2), reserved (2), ID (2), cost (2).
     for server_id in sorted(routing_table):
         server_ip = servers[server_id]["ip"]
         server_port = servers[server_id]["port"]
         cost = routing_table[server_id]["cost"]
-
-        if cost == float("inf"):
-            cost = INFINITY
-
-        entry = struct.pack(
-            "!4sHHHH",
-            socket.inet_aton(server_ip),
-            server_port,
-            0,
-            server_id,
-            cost
-        )
-
-        packet += entry
-
+        wire_cost = INFINITY if cost >= INFINITY else int(cost)
+        packet += struct.pack("!4sHHHH", socket.inet_aton(server_ip),
+                              server_port, 0, server_id, wire_cost)
     return packet
+
 
 
 def decode_routing_packet(data):
@@ -292,323 +265,271 @@ def decode_routing_packet(data):
 
 #temporary routing table format, not final explicit formal required by this assignment
 def display_routing_table(routing_table):
-    print("Destination\tNext Hop\tCost")
-
+    # Exact three-column format required by the assignment.
+    # An unreachable destination has no next hop (-1) and infinite cost.
     for destination in sorted(routing_table):
         next_hop = routing_table[destination]["next_hop"]
         cost = routing_table[destination]["cost"]
+        print(f"{destination} {next_hop if next_hop is not None else -1} "
+              f"{'inf' if cost == float('inf') else cost}")
 
-        if next_hop is None:
-            next_hop = "N/A"
-
-        print(f"{destination}\t\t{next_hop}\t\t{cost}")
 
 
 def bellman_ford(my_id, servers, neighbors,
                  neighbor_vectors, routing_table):
-
     updated = False
 
-    # Calculate the best path to every destination
     for destination in servers:
-
-        # The cost to reach ourselves is always zero
         if destination == my_id:
-            best_cost = 0
-            best_next_hop = my_id
-
+            best_cost, best_next_hop = 0, my_id
         else:
-            # Start with the direct link, if one exists
-            best_cost = neighbors.get(
-                destination, float("inf")
-            )
+            best_cost = neighbors.get(destination, float("inf"))
+            best_next_hop = destination if best_cost != float("inf") else None
 
-            best_next_hop = (
-                destination
-                if best_cost != float("inf")
-                else None
-            )
-
-            # Examine every directly connected neighbor
             for neighbor_id, link_cost in neighbors.items():
-
-                # Ignore disabled or unreachable neighbors
-                if link_cost == float("inf"):
+                if link_cost == float("inf") or neighbor_id not in neighbor_vectors:
                     continue
 
-                # Skip neighbors that haven't sent a vector
-                if neighbor_id not in neighbor_vectors:
-                    continue
+                neighbor_cost = neighbor_vectors[neighbor_id].get(
+                    destination, float("inf"))
+                
+                candidate = link_cost + neighbor_cost
+                # Reserve the 16-bit 65535 value for infinity.
+                
+                if candidate >= INFINITY:
+                    candidate = float("inf")
 
-                # Neighbor's advertised cost to destination
-                neighbor_cost = neighbor_vectors[
-                    neighbor_id
-                ].get(destination, float("inf"))
+                if candidate < best_cost:
+                    best_cost, best_next_hop = candidate, neighbor_id
 
-                # Bellman-Ford equation:
-                # D_x(y) = min(c(x,v) + D_v(y))
-                new_cost = link_cost + neighbor_cost
-
-                if new_cost < best_cost:
-                    best_cost = new_cost
-                    best_next_hop = neighbor_id
-
-        # Compare calculated route against current route
         old_route = routing_table[destination]
 
-        if (
-            old_route["cost"] != best_cost
-            or old_route["next_hop"] != best_next_hop
-        ):
+        if old_route["cost"] != best_cost or old_route["next_hop"] != best_next_hop:
             routing_table[destination] = {
-                "next_hop": best_next_hop,
-                "cost": best_cost
+                "next_hop": best_next_hop, "cost": best_cost
             }
-
             updated = True
-
+    
     return updated
 
-def update_link(my_id, server1, server2, new_cost, servers, 
+
+def update_link(my_id, server1, server2, new_cost, servers,
                 neighbors, neighbor_vectors, routing_table):
-
-    #Verify that both IDs exist 
-    if server1 not in servers or server2 not in servers:
+    
+    if server1 not in servers or server2 not in servers or server1 == server2:
+        raise ValueError("Invalid server IDs")
+    
+    if my_id not in (server1, server2):
         raise ValueError("Link does not involve this server")
-
-    #verify that this command involes the local server
-    if my_id != server1 and my_id != server2:
-        raise ValueError("Link does not involve this server")
-
-    #idetify this other server 
+    
     neighbor_id = server2 if my_id == server1 else server1
 
-    #see if the other server is a DIRECT neighbor 
     if neighbor_id not in neighbors:
         raise ValueError("Server is not a direct neighbor")
+    
+    if new_cost != float("inf") and not (0 <= new_cost < INFINITY):
+        raise ValueError("Invalid link cost")
 
-    #update direct link cost
     neighbors[neighbor_id] = new_cost
+    # Reuse the neighbor's latest vector with the new finite link cost.
+    # Discard it only when the link is disabled.
+    if new_cost == float("inf"):
+        neighbor_vectors.pop(neighbor_id, None)
+    return bellman_ford(my_id, servers, neighbors,
+                        neighbor_vectors, routing_table)
 
-    # Recalculate routing table
-    updated = bellman_ford(
-        my_id,
-        servers,
-        neighbors,
-        neighbor_vectors,
-        routing_table
-    )
-
-    return updated
 
 def commands():
     print(
-        "\nType 'step' to send a test message.\n"
-        "Type 'update <server-ID1> <server-ID2> <New Link Cost>' to update cost between the links\n"
-        "Type 'packets' to display the number of packets received since the last invoivation\n"
-        "Type 'display' to display routing table\n"
-        "Type 'disable <server-ID>' to disable link to given server\n"
-        "Type 'crash' to close all connections in this server\n"
+        "\nType 'step' to send a routing update.\n"
+        "Type 'update <server-ID1> <server-ID2> <New Link Cost>' to change a link.\n"
+        "Type 'packets' to display and reset the received packet count.\n"
+        "Type 'display' to display the routing table.\n"
+        "Type 'disable <server-ID>' to disable a direct link.\n"
+        "Type 'crash' to simulate a server crash.\n"
         "Type 'exit' to stop the server.\n"
-        "Type 'commands' to recieve command list\n"
-        )
+        "Type 'commands' to show this list.\n"
+    )
+
 
 def periodic_updates(sock, my_id, servers, neighbors,
                      neighbor_vectors, routing_table,
-                     routing_lock, last_seen, interval, stop_event):
-
+                     routing_lock, last_seen, configured_costs,
+                     timed_out, interval, stop_event):
+    
     while not stop_event.wait(interval):
-        now = time.monotonic()
-        timed_out = []
-
         with routing_lock:
-            for neighbor_id, link_cost in neighbors.items():
-                if (
-                    link_cost != float("inf")
-                    and now - last_seen[neighbor_id] >= 3 * interval
-                ):
+            now = time.monotonic()
+            for neighbor_id, link_cost in list(neighbors.items()):
+                if (link_cost != float("inf")
+                        and now - last_seen[neighbor_id] >= 3 * interval):
                     neighbors[neighbor_id] = float("inf")
                     neighbor_vectors.pop(neighbor_id, None)
-                    timed_out.append(neighbor_id)
+                    timed_out.add(neighbor_id)
 
-            if timed_out:
-                bellman_ford(
-                    my_id, servers, neighbors,
-                    neighbor_vectors, routing_table
-                )
-                for neighbor_id in timed_out:
-                    print(f"Server {neighbor_id} timed out.")
+                    print(f"\nServer {neighbor_id} timed out.")
+                    bellman_ford(my_id, servers, neighbors,
+                                 neighbor_vectors, routing_table)
 
-            send_messages(sock, my_id, servers, neighbors, routing_table)
+            # No triggered advertisements: only periodic or step sends.
+            try:
+                send_messages(sock, my_id, servers, neighbors, routing_table)
+            except OSError as error:
+                if not stop_event.is_set():
+                    print(f"Periodic update ERROR: {error}")
+
 
 def main():
-    parser = argparse.ArgumentParser()
+    global packet_count
 
+    parser = argparse.ArgumentParser()
     parser.add_argument("-t", required=True, help="Topology file")
     parser.add_argument("-i", required=True, type=int, help="Update interval")
-
+    
     args = parser.parse_args()
-
-    #prints topology file content and terminal cmd
-    '''if args.i <= 0:
+    
+    if args.i <= 0:
         parser.error("Update interval must be positive")
 
-    print("Topology file:", args.t)
-    print("Update interval:", args.i)
-
-    with open(args.t, "r") as file:
-        print(file.read())
-'''
     my_id, num_servers, num_neighbors, servers, neighbors = read_topology(args.t)
-
-    routing_table = initialize_routing_table(
-    my_id,
-    servers,
-    neighbors
-    )
-
+    
+    routing_table = initialize_routing_table(my_id, servers, neighbors)
     neighbor_vectors = {}
 
-    last_seen = {
-    	neighbor_id: time.monotonic()
-    	for neighbor_id in neighbors
-    }
+    configured_costs = neighbors.copy()  # last explicitly set link cost
+    timed_out = set()                     # neighbors lost due to missed updates
+    last_seen = {neighbor_id: time.monotonic() for neighbor_id in neighbors}
+    routing_lock = threading.Lock()
     stop_event = threading.Event()
 
-    routing_lock = threading.Lock()
-
-    # Create and bind UDP socket
     sock = initialize_socket(my_id, servers)
+    sock.settimeout(0.5)  # receiver can periodically check stop_event
 
-    # Start receiving messages in a separate thread
     receiver_thread = threading.Thread(
         target=receive_messages,
-        args=(
-            sock,
-            my_id,
-            servers,
-            neighbors,
-            neighbor_vectors,
-            routing_table,
-            routing_lock,
-	        last_seen
-        ),
+        args=(sock, my_id, servers, neighbors, neighbor_vectors,
+              routing_table, routing_lock, last_seen,
+              configured_costs, timed_out, stop_event),
         daemon=True
     )
-
+    
     receiver_thread.start()
 
     periodic_thread = threading.Thread(
         target=periodic_updates,
-        args=(
-            sock, my_id, servers, neighbors,
-            neighbor_vectors, routing_table, routing_lock,
-            last_seen, args.i, stop_event
-        ),
+        args=(sock, my_id, servers, neighbors, neighbor_vectors,
+              routing_table, routing_lock, last_seen,
+              configured_costs, timed_out, args.i, stop_event),
         daemon=True
     )
+    
     periodic_thread.start()
-
     commands()
-
-    global packet_count
 
     try:
         while True:
-            # inputs made into string list
-            # ["update", "server#", "neighserver#", "new cost"]
-            command = input("> ").strip().lower()
-            command_parts = command.split()
+            command = input("> ").strip()
+            command_parts = command.lower().split()
+            if not command_parts:
+                continue
+            action = command_parts[0]
 
-            #command_parts[0] is the action the user wants to do 
-            if command_parts[0] == "step":
-                with routing_lock:
-                    send_messages(
-                        sock, my_id, servers, neighbors, routing_table
-                    )
-                    
-            elif command_parts[0] == "update":
-
-                if len(command_parts) != 4:
-                    print("update ERROR: Invalid arguments")
-                    continue
-
-                try:
-                    server1 = int(command_parts[1])
-                    server2 = int(command_parts[2])
-
-                    if command_parts[3] == "inf":
-                        new_cost = float("inf")
-                    else:
-                        new_cost = int(command_parts[3])
-                        
-                        if new_cost <0 or new_cost >= INFINITY:
-                        
-                            raise ValueError("Invalid link cost")
-                
-                    with routing_lock:
-                        update_link(my_id, server1, server2, new_cost,servers,
-                                    neighbors,neighbor_vectors, routing_table)
-                        neighbor_id = server2 if my_id == server1 else server1
-                        last_seen[neighbor_id] = time.monotonic()
-                        display_routing_table(routing_table)
-                    print(f"{command} SUCCESS")
-                
-                except ValueError as error:
-                    print(f"{command} ERROR: {error}")        
-
-            elif command_parts[0] == "packets":
-                with routing_lock:
-                    print(f"Packets: {packet_count}")
-                    packet_count = 0
-                    print("packets SUCCESS")
-
-            elif command_parts[0] == "disable":
-                if len(command_parts) != 2:
+            if action == "step":
+                if len(command_parts) != 1:
                     print(f"{command} ERROR: Invalid arguments")
                     continue
+
                 try:
-                    neighbor_id = int(command_parts[1])
-
                     with routing_lock:
-                        update_link(
-                            my_id,
-                            my_id,
-                            neighbor_id,
-                            float("inf"),
-                            servers,
-                            neighbors,
-                            neighbor_vectors,
-                            routing_table
-                        )
-
+                        send_messages(sock, my_id, servers, neighbors, routing_table)
                     print(f"{command} SUCCESS")
 
+                except (OSError, ValueError) as error:
+                    print(f"{command} ERROR: {error}")
+
+            elif action == "update":
+                if len(command_parts) != 4:
+                    print(f"{command} ERROR: Invalid arguments")
+                    continue
+
+                try:
+                    server1, server2 = int(command_parts[1]), int(command_parts[2])
+                    new_cost = (float("inf") if command_parts[3] == "inf"
+                                else int(command_parts[3]))
+                    
+                    if new_cost != float("inf") and not (0 <= new_cost < INFINITY):
+                        raise ValueError("Invalid link cost")
+                    with routing_lock:
+                        update_link(my_id, server1, server2, new_cost, servers,
+                                    neighbors, neighbor_vectors, routing_table)
+                        neighbor_id = server2 if my_id == server1 else server1
+                        configured_costs[neighbor_id] = new_cost
+                        timed_out.discard(neighbor_id)
+                        last_seen[neighbor_id] = time.monotonic()
+                    print(f"{command} SUCCESS")
                 except ValueError as error:
                     print(f"{command} ERROR: {error}")
 
-            elif command_parts[0] == "crash":
+            elif action == "packets":
+                if len(command_parts) != 1:
+                    print(f"{command} ERROR: Invalid arguments")
+                    continue
+
+                with routing_lock:
+                    print(f"Packets: {packet_count}")
+                    packet_count = 0
+                print(f"{command} SUCCESS")
+
+            elif action == "disable":
+                if len(command_parts) != 2:
+                    print(f"{command} ERROR: Invalid arguments")
+                    continue
+
+                try:
+                    neighbor_id = int(command_parts[1])
+                    with routing_lock:
+                        update_link(my_id, my_id, neighbor_id, float("inf"),
+                                    servers, neighbors, neighbor_vectors,
+                                    routing_table)
+                        configured_costs[neighbor_id] = float("inf")
+                        timed_out.discard(neighbor_id)
+                    print(f"{command} SUCCESS")
+                
+                except ValueError as error:
+                    print(f"{command} ERROR: {error}")
+
+            elif action == "display":
+                if len(command_parts) != 1:
+                    print(f"{command} ERROR: Invalid arguments")
+                    continue
+
+                with routing_lock:
+                    display_routing_table(routing_table)
+                print(f"{command} SUCCESS")
+
+            elif action == "crash":
+                if len(command_parts) != 1:
+                    print(f"{command} ERROR: Invalid arguments")
+                    continue
+
                 print(f"{command} SUCCESS")
                 break
 
-            elif command_parts[0] == "display":
-                display_routing_table(routing_table)
-
-            elif command_parts[0] == "exit":
+            elif action == "exit":
                 break
-            
-            elif command_parts[0] == "commands":
-                commands()
-            
 
+            elif action == "commands":
+                commands()
+                
             else:
-                print("Unknown command")
+                print(f"{command} ERROR: Unknown command")
 
     except (KeyboardInterrupt, EOFError):
         pass
-
     finally:
         stop_event.set()
+        periodic_thread.join(timeout=2)
+        receiver_thread.join(timeout=1)
         sock.close()
         print(f"Server {my_id} stopped.")
 
