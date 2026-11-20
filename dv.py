@@ -313,15 +313,19 @@ def bellman_ford(my_id, servers, neighbors,
     return updated
 
 
+
 def update_link(my_id, server1, server2, new_cost, servers,
                 neighbors, neighbor_vectors, routing_table):
     
+    #checking if IDs given actually are part of the working server set
     if server1 not in servers or server2 not in servers or server1 == server2:
         raise ValueError("Invalid server IDs")
     
+    #See if id given ID is even able to be used
     if my_id not in (server1, server2):
         raise ValueError("Link does not involve this server")
     
+    #check which is the 
     neighbor_id = server2 if my_id == server1 else server1
 
     if neighbor_id not in neighbors:
@@ -339,6 +343,7 @@ def update_link(my_id, server1, server2, new_cost, servers,
                         neighbor_vectors, routing_table)
 
 
+#printing out the commands the user can use.
 def commands():
     print(
         "\nType 'step' to send a routing update.\n"
@@ -428,6 +433,7 @@ def main():
 
     try:
         while True:
+            #split command into a list of strings , command_parts[0] would be the commmand user wants to execute
             command = input("> ").strip()
             command_parts = command.lower().split()
             if not command_parts:
@@ -448,17 +454,24 @@ def main():
                     print(f"{command} ERROR: {error}")
 
             elif action == "update":
+                
+                #checking to see if it has all 4 parts
                 if len(command_parts) != 4:
                     print(f"{command} ERROR: Invalid arguments")
                     continue
-
+                
+                #change string in proper int for servers 
+                #checking if cost is infinite
                 try:
                     server1, server2 = int(command_parts[1]), int(command_parts[2])
                     new_cost = (float("inf") if command_parts[3] == "inf"
                                 else int(command_parts[3]))
                     
+                    #checking for valid cost input or print message for user
                     if new_cost != float("inf") and not (0 <= new_cost < INFINITY):
                         raise ValueError("Invalid link cost")
+                    
+                    #check if command is being used in the server and if 2nd sever is a neighbor. 
                     with routing_lock:
                         update_link(my_id, server1, server2, new_cost, servers,
                                     neighbors, neighbor_vectors, routing_table)
