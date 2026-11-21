@@ -297,7 +297,7 @@ def display_routing_table(routing_table):
               f"{'inf' if cost == float('inf') else cost}")
 
 
-
+ROUTE_INFINITY = 10
 def bellman_ford(my_id, servers, neighbors,
                  neighbor_vectors, routing_table):
     # For each destination d, compare the direct link with every usable route
@@ -322,7 +322,7 @@ def bellman_ford(my_id, servers, neighbors,
                 candidate = link_cost + neighbor_cost
                 # Reserve the 16-bit 65535 value for infinity.
                 
-                if candidate >= INFINITY:
+                if candidate >= ROUTE_INFINITY:
                     candidate = float("inf")
 
                 if candidate < best_cost:
