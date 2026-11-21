@@ -347,20 +347,23 @@ def update_link(my_id, server1, server2, new_cost, servers,
     if server1 not in servers or server2 not in servers or server1 == server2:
         raise ValueError("Invalid server IDs")
     
-    #See if id given ID is even able to be used
+    #verify that this command involes the local server
     if my_id not in (server1, server2):
         raise ValueError("Link does not involve this server")
     
-    #check which is the 
+    #idetify neighbor server 
     neighbor_id = server2 if my_id == server1 else server1
 
+     #see if the other server is a DIRECT neighbo
     if neighbor_id not in neighbors:
         raise ValueError("Server is not a direct neighbor")
     
     if new_cost != float("inf") and not (0 <= new_cost < INFINITY):
         raise ValueError("Invalid link cost")
 
+    #update direct link cost
     neighbors[neighbor_id] = new_cost
+    
     # Reuse the neighbor's latest vector with the new finite link cost.
     # Discard it only when the link is disabled.
     if new_cost == float("inf"):
